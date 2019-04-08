@@ -1,34 +1,32 @@
-// EEPROM Programmer - code for an Arduino Mega 2560
+/*
+// EEPROM Programmer with I2C I/O expanders
 //
-// Written by K Adcock.
-//       Jan 2016 - Initial release
-//       Dec 2017 - Slide code tartups, to remove compiler errors for new Arduino IDE (1.8.5).
-//   7th Dec 2017 - Updates from Dave Curran of Tynemouth Software, adding commands to enable/disable SDP.
-//  10th Dec 2017 - Fixed one-byte EEPROM corruption (always byte 0) when unprotecting an EEPROM
-//                  (doesn't matter if you write a ROM immediately after, but does matter if you use -unprotect in isolation)
-//                - refactored code a bit (split loop() into different functions)
-//                - properly looked at timings on the Atmel datasheet, and worked out that my delays
-//                  during reads and writes were about 10,000 times too big!
-//                  Reading and writing is now orders-of-magnitude quicker.
-//
-// Distributed under an acknowledgement licence, because I'm a shallow, attention-seeking tart. :)
-//
+// 
+// Base and core Written by K Adcock.
 // http://danceswithferrets.org/geekblog/?page_id=903
 //
-// This software presents a 9600-8N1 serial port.
+// I2C modifications by JDat
+// Support for 32 pin (up to 512k * 8 ) Flash
+//
+// This software presents a 115200-8N1 serial port.
 //
 // R[hex address]                         - reads 16 bytes of data from the EEPROM
 // W[hex address]:[data in two-char hex]  - writes up to 16 bytes of data to the EEPROM
 // P                                      - set write-protection bit (Atmels only, AFAIK)
 // U                                      - clear write-protection bit (ditto)
 // V                                      - prints the version string
+// E                                      - Erase all chip contents to 0xFF
 //
 // Any data read from the EEPROM will have a CRC checksum appended to it (separated by a comma).
 // If a string of data is sent with an optional checksum, then this will be checked
 // before anything is written.
 //
 
-#include <avr/pgmspace.h>
+*/
+//#include <avr/pgmspace.h>
+//#include <Wire.h>
+#include "pindefine.h"
+#include "Adafruit_MCP23017.h"
 
 const char hex[] =
 {
@@ -38,84 +36,73 @@ const char hex[] =
 
 const char version_string[] = {"EEPROM Version=0.02"};
 
-static const int kPin_Addr14  = 24;
-static const int kPin_Addr12  = 26;
-static const int kPin_Addr7   = 28;
-static const int kPin_Addr6   = 30;
-static const int kPin_Addr5   = 32;
-static const int kPin_Addr4   = 34;
-static const int kPin_Addr3   = 36;
-static const int kPin_Addr2   = 38;
-static const int kPin_Addr1   = 40;
-static const int kPin_Addr0   = 42;
-static const int kPin_Data0   = 44;
-static const int kPin_Data1   = 46;
-static const int kPin_Data2   = 48;
-static const int kPin_nWE     = 27;
-static const int kPin_Addr13  = 29;
-static const int kPin_Addr8   = 31;
-static const int kPin_Addr9   = 33;
-static const int kPin_Addr11  = 35;
-static const int kPin_nOE     = 37;
-static const int kPin_Addr10  = 39;
-static const int kPin_nCE     = 41;
-static const int kPin_Data7   = 43;
-static const int kPin_Data6   = 45;
-static const int kPin_Data5   = 47;
-static const int kPin_Data4   = 49;
-static const int kPin_Data3   = 51;
-static const int kPin_WaitingForInput  = 13;
-static const int kPin_LED_Red = 22;
-static const int kPin_LED_Grn = 53;
+static const int kPin_WaitingForInput  = LED_BUILTIN;
 
 byte g_cmd[80]; // strings received from the controller will go in here
 static const int kMaxBufferSize = 16;
 byte buffer[kMaxBufferSize];
 
-static const long int k_uTime_WritePulse_uS = 1;
-static const long int k_uTime_ReadPulse_uS = 1;
-// (to be honest, both of the above are about ten times too big - but the Arduino won't reliably
-// delay down at the nanosecond level, so this is the best we can do.)
+uint16_t ic1out=0;
+uint16_t ic2out=0;
 
-// the setup function runs once when you press reset or power the board
+Adafruit_MCP23017 mcp1;
+Adafruit_MCP23017 mcp2;
+
+void setAddrOut(){
+  for (uint8_t i=0;i<=18;i++){
+    if (addrRoute[i]==IC1){
+      mcp1.pinMode(addrArray[i],OUTPUT);
+      
+    } else if (addrRoute[i]==IC2){
+      mcp2.pinMode(addrArray[i],OUTPUT);
+    }
+  }
+}
+
 void setup()
 {
-  Serial.begin(57600);
+  Serial.begin(115200);
 
+  //Wire.setClock(400000);
+  Wire.setClock(1000000);
+  //Wire.setClock(3400000);
+
+  //Wire.begin();
+  mcp1.begin(IC1);
+  mcp2.begin(IC2);
+
+  
   pinMode(kPin_WaitingForInput, OUTPUT); digitalWrite(kPin_WaitingForInput, HIGH);
-  pinMode(kPin_LED_Red, OUTPUT); digitalWrite(kPin_LED_Red, LOW);
-  pinMode(kPin_LED_Grn, OUTPUT); digitalWrite(kPin_LED_Grn, LOW);
 
   // address lines are ALWAYS outputs
-  pinMode(kPin_Addr0,  OUTPUT);
-  pinMode(kPin_Addr1,  OUTPUT);
-  pinMode(kPin_Addr2,  OUTPUT);
-  pinMode(kPin_Addr3,  OUTPUT);
-  pinMode(kPin_Addr4,  OUTPUT);
-  pinMode(kPin_Addr5,  OUTPUT);
-  pinMode(kPin_Addr6,  OUTPUT);
-  pinMode(kPin_Addr7,  OUTPUT);
-  pinMode(kPin_Addr8,  OUTPUT);
-  pinMode(kPin_Addr9,  OUTPUT);
-  pinMode(kPin_Addr10, OUTPUT);
-  pinMode(kPin_Addr11, OUTPUT);
-  pinMode(kPin_Addr12, OUTPUT);
-  pinMode(kPin_Addr13, OUTPUT);
-  pinMode(kPin_Addr14, OUTPUT);
-
+  setAddrOut();
+  
   // control lines are ALWAYS outputs
-  pinMode(kPin_nCE, OUTPUT); digitalWrite(kPin_nCE, LOW); // might as well keep the chip enabled ALL the time
-  pinMode(kPin_nOE, OUTPUT); digitalWrite(kPin_nOE, HIGH);
-  pinMode(kPin_nWE, OUTPUT); digitalWrite(kPin_nWE, HIGH); // not writing
+  //pinMode(kPin_nCE, OUTPUT); digitalWrite(kPin_nCE, LOW); // might as well keep the chip enabled ALL the time
+  mcp1.pinMode(cepin,OUTPUT); bitClear(ic1out,cepin);
+  mcp1.writeGPIOAB(ic1out);
+  //pinMode(kPin_nOE, OUTPUT); digitalWrite(kPin_nOE, HIGH);
+  mcp1.pinMode(oepin,OUTPUT); bitSet(ic1out,oepin);
+  mcp1.writeGPIOAB(ic1out);
+
+  //pinMode(kPin_nWE, OUTPUT); digitalWrite(kPin_nWE, HIGH); // not writing
+  mcp1.pinMode(wepin,OUTPUT); bitSet(ic1out,wepin);
+  mcp1.writeGPIOAB(ic1out);
 
   SetDataLinesAsInputs();
   SetAddress(0);
+
+  //Serial.println("chip Erase start");
+  //void EraseChip();
+  //delay(300);
+  //Serial.println("Erase complete");
+//  while (-1){
+//    
+//  }
 }
 
 void loop()
 {
-  while (true)
-  {
     digitalWrite(kPin_WaitingForInput, HIGH);
     ReadString();
     digitalWrite(kPin_WaitingForInput, LOW);
@@ -127,10 +114,10 @@ void loop()
       case 'U': SetSDPState(false); break;
       case 'R': ReadEEPROM(); break;
       case 'W': WriteEEPROM(); break;
+      case 'E': eraseChip(); break;
       case 0: break; // empty string. Don't mind ignoring this.
       default: Serial.println("ERR Unrecognised command"); break;
     }
-  }
 }
 
 void ReadEEPROM() // R<address>  - read kMaxBufferSize bytes from EEPROM, beginning at <address> (in hex)
@@ -142,32 +129,37 @@ void ReadEEPROM() // R<address>  - read kMaxBufferSize bytes from EEPROM, beginn
   }
 
   // decode ASCII representation of address (in hex) into an actual value
-  int addr = 0;
+  long addr = 0;
   int x = 1;
-  while (x < 5 && g_cmd[x] != 0)
+  while (x < 6 && g_cmd[x] != 0)
   {
     addr = addr << 4;
     addr |= HexToVal(g_cmd[x++]);
   }
 
-  digitalWrite(kPin_nWE, HIGH); // disables write
+  //Serial.println("Read addr: " + String(addr,HEX) );
+  //digitalWrite(kPin_nWE, HIGH); // disables write
+  bitSet(ic1out,wepin); mcp1.writeGPIOAB(ic1out);
+
   SetDataLinesAsInputs();
-  digitalWrite(kPin_nOE, LOW); // makes the EEPROM output the byte
-  delayMicroseconds(1);
+  //digitalWrite(kPin_nOE, LOW); // makes the EEPROM output the byte
+  bitClear(ic1out,oepin); mcp1.writeGPIOAB(ic1out);
 
   ReadEEPROMIntoBuffer(addr, kMaxBufferSize);
 
   // now print the results, starting with the address as hex ...
-  Serial.print(hex[ (addr & 0xF000) >> 12 ]);
-  Serial.print(hex[ (addr & 0x0F00) >> 8  ]);
-  Serial.print(hex[ (addr & 0x00F0) >> 4  ]);
-  Serial.print(hex[ (addr & 0x000F)       ]);
+  Serial.print(hex[ (addr & 0xF0000) >> 16 ]);
+  Serial.print(hex[ (addr & 0x0F000) >> 12 ]);
+  Serial.print(hex[ (addr & 0x00F00) >> 8  ]);
+  Serial.print(hex[ (addr & 0x000F0) >> 4  ]);
+  Serial.print(hex[ (addr & 0x0000F)       ]);
   Serial.print(":");
   PrintBuffer(kMaxBufferSize);
 
   Serial.println("OK");
 
-  digitalWrite(kPin_nOE, HIGH); // stops the EEPROM outputting the byte
+  //digitalWrite(kPin_nOE, HIGH); // stops the EEPROM outputting the byte
+  bitSet(ic1out,oepin); mcp1.writeGPIOAB(ic1out);
 }
 
 void WriteEEPROM() // W<four byte hex address>:<data in hex, two characters per byte, max of 16 bytes per line>
@@ -178,7 +170,7 @@ void WriteEEPROM() // W<four byte hex address>:<data in hex, two characters per 
     return;
   }
 
-  int addr = 0;
+  long addr = 0;
   int x = 1;
   while (g_cmd[x] != ':' && g_cmd[x] != 0)
   {
@@ -235,6 +227,42 @@ void WriteEEPROM() // W<four byte hex address>:<data in hex, two characters per 
   }
 }
 
+void eraseChip()
+{
+  //digitalWrite(kPin_LED_Red, HIGH);
+
+  //digitalWrite(kPin_nWE, HIGH); // disables write
+  bitSet(ic1out,wepin); mcp1.writeGPIOAB(ic1out);
+  //digitalWrite(kPin_nOE, LOW); // makes the EEPROM output the byte
+  bitClear(ic1out,oepin); mcp1.writeGPIOAB(ic1out);
+  //SetDataLinesAsInputs();
+
+  //byte bytezero = ReadByteFrom(0);
+
+  //digitalWrite(kPin_nOE, HIGH); // stop EEPROM from outputting byte
+  bitSet(ic1out,oepin); mcp1.writeGPIOAB(ic1out);
+  //digitalWrite(kPin_nCE, HIGH);
+  bitClear(ic1out,cepin); mcp1.writeGPIOAB(ic1out);
+  
+  SetDataLinesAsOutputs();
+
+    WriteByteTo(0x5555, 0xAA);
+    WriteByteTo(0x2AAA, 0x55);
+    WriteByteTo(0x5555, 0x80);
+    WriteByteTo(0x5555, 0xAA);
+    WriteByteTo(0x2AAA, 0x55);
+    WriteByteTo(0x5555, 0x10);
+
+  //WriteByteTo(0x0000, bytezero); // this "dummy" write is required so that the EEPROM will flush its buffer of commands.
+
+  //digitalWrite(kPin_nCE, LOW); // return to on by default for the rest of the code
+  //bitClear(ic1out,cepin); mcp1.writeGPIOAB(ic1out);
+  
+  bitSet(ic1out,cepin); mcp1.writeGPIOAB(ic1out);
+  delay(300);
+  Serial.println("OK");
+}
+
 // Important note: the EEPROM needs to have data written to it immediately after sending the "unprotect" command, so that the buffer is flushed.
 // So we read byte 0 from the EEPROM first, then use that as the dummy write afterwards.
 // It wouldn't matter if this facility was used immediately before writing an EEPROM anyway ... but it DOES matter if you use this option
@@ -242,37 +270,22 @@ void WriteEEPROM() // W<four byte hex address>:<data in hex, two characters per 
 
 void SetSDPState(bool bWriteProtect)
 {
-  digitalWrite(kPin_LED_Red, HIGH);
+  //digitalWrite(kPin_LED_Red, HIGH);
 
-  digitalWrite(kPin_nWE, HIGH); // disables write
-  digitalWrite(kPin_nOE, LOW); // makes the EEPROM output the byte
+  //digitalWrite(kPin_nWE, HIGH); // disables write
+  bitSet(ic1out,wepin); mcp1.writeGPIOAB(ic1out);
+  //digitalWrite(kPin_nOE, LOW); // makes the EEPROM output the byte
+  bitClear(ic1out,oepin); mcp1.writeGPIOAB(ic1out);
   SetDataLinesAsInputs();
 
   byte bytezero = ReadByteFrom(0);
 
-  digitalWrite(kPin_nOE, HIGH); // stop EEPROM from outputting byte
-  digitalWrite(kPin_nCE, HIGH);
+  //digitalWrite(kPin_nOE, HIGH); // stop EEPROM from outputting byte
+  bitSet(ic1out,oepin); mcp1.writeGPIOAB(ic1out);
+  //digitalWrite(kPin_nCE, HIGH);
+  bitSet(ic1out,cepin); mcp1.writeGPIOAB(ic1out);
+  
   SetDataLinesAsOutputs();
-
-  // Different chips can have different byte sequences.
-  // Check the data sheet if your chip doesn't match on of the below.
-
-  // Use this is for the AT28C64B
-  // if (bWriteProtect)
-  // {
-  //   WriteByteTo(0x1555, 0xAA);
-  //   WriteByteTo(0x0AAA, 0x55);
-  //   WriteByteTo(0x1555, 0xA0);
-  // }
-  // else
-  // {
-  //   WriteByteTo(0x1555, 0xAA);
-  //   WriteByteTo(0x0AAA, 0x55);
-  //   WriteByteTo(0x1555, 0x80);
-  //   WriteByteTo(0x1555, 0xAA);
-  //   WriteByteTo(0x0AAA, 0x55);
-  //   WriteByteTo(0x1555, 0x20);
-  // }
 
   // This is for the AT28C256
   if (bWriteProtect)
@@ -283,149 +296,195 @@ void SetSDPState(bool bWriteProtect)
   }
   else
   {
+
     WriteByteTo(0x5555, 0xAA);
     WriteByteTo(0x2AAA, 0x55);
     WriteByteTo(0x5555, 0x80);
     WriteByteTo(0x5555, 0xAA);
     WriteByteTo(0x2AAA, 0x55);
     WriteByteTo(0x5555, 0x20);
+
+    //WriteByteTo(0x5555, 0xAA);
+    //WriteByteTo(0x2AAA, 0x55);
+    //WriteByteTo(0x5555, 0xA0);
+
+    //WriteByteTo(0x5555, 0xAA);
+
+    //WriteByteTo(0x2AAA, 0x55);
+
+    //WriteByteTo(0x5555, 0x20);
+
   }
 
-  WriteByteTo(0x0000, bytezero); // this "dummy" write is required so that the EEPROM will flush its buffer of commands.
+  //WriteByteTo(0x0000, bytezero); // this "dummy" write is required so that the EEPROM will flush its buffer of commands.
 
-  digitalWrite(kPin_nCE, LOW); // return to on by default for the rest of the code
-  digitalWrite(kPin_LED_Red, LOW);
+  //digitalWrite(kPin_nCE, LOW); // return to on by default for the rest of the code
+  //bitClear(ic1out,cepin); mcp1.writeGPIOAB(ic1out);
+  
+  //bitSet(ic1out,cepin); mcp1.writeGPIOAB(ic1out);
 
-  Serial.print("OK SDP ");
-  if (bWriteProtect)
-  {
-    Serial.println("enabled");
-  }
-  else
-  {
-    Serial.println("disabled");
-  }
+  //Serial.print("OK SDP ");
+  //if (bWriteProtect)
+  //{
+    //Serial.println("enabled");
+  //}
+  //else
+  //{
+    //Serial.println("disabled");
+  //}
 }
 
 // ----------------------------------------------------------------------------------------
 
-void ReadEEPROMIntoBuffer(int addr, int size)
+void ReadEEPROMIntoBuffer(long addr, int size)
 {
-  digitalWrite(kPin_LED_Grn, HIGH);
-  digitalWrite(kPin_nWE, HIGH);
+  //digitalWrite(kPin_nWE, HIGH);
+  bitSet(ic1out,wepin); mcp1.writeGPIOAB(ic1out);
   SetDataLinesAsInputs();
-  digitalWrite(kPin_nOE, LOW);
+  //digitalWrite(kPin_nOE, LOW);
+  bitClear(ic1out,oepin); mcp1.writeGPIOAB(ic1out);
 
   for (int x = 0; x < size; ++x)
   {
     buffer[x] = ReadByteFrom(addr + x);
   }
 
-  digitalWrite(kPin_nOE, HIGH);
-  digitalWrite(kPin_LED_Grn, LOW);
+  //digitalWrite(kPin_nOE, HIGH);
+  bitSet(ic1out,oepin); mcp1.writeGPIOAB(ic1out);
 }
 
-void WriteBufferToEEPROM(int addr, int size)
+void WriteBufferToEEPROM(long addr, int size)
 {
-  digitalWrite(kPin_LED_Red, HIGH);
-  digitalWrite(kPin_nOE, HIGH); // stop EEPROM from outputting byte
-  digitalWrite(kPin_nWE, HIGH); // disables write
+  //bitSet(ic1out,cepin); mcp1.writeGPIOAB(ic1out);
+  
+  //digitalWrite(kPin_nOE, HIGH); // stop EEPROM from outputting byte
+  bitSet(ic1out,oepin); mcp1.writeGPIOAB(ic1out);
+  //digitalWrite(kPin_nWE, HIGH); // disables write
+  bitSet(ic1out,wepin); mcp1.writeGPIOAB(ic1out);
+  
   SetDataLinesAsOutputs();
 
+  bitClear(ic1out,cepin); mcp1.writeGPIOAB(ic1out);      
+  
   for (uint8_t x = 0; x < size; ++x)
   {
+    //SetSDPState(true);
+    WriteByteTo(0x5555, 0xAA);
+    WriteByteTo(0x2AAA, 0x55);
+    WriteByteTo(0x5555, 0xA0);
     WriteByteTo(addr + x, buffer[x]);
+    for (uint8_t i=0;i<=2;i++){
+      //WriteByteTo(addr + x, buffer[x]);
+      bitClear(ic1out,wepin); mcp1.writeGPIOAB(ic1out);
+//      bitClear(ic1out,cepin); mcp1.writeGPIOAB(ic1out);      
+      bitSet(ic1out,wepin); mcp1.writeGPIOAB(ic1out);
+//      bitSet(ic1out,cepin); mcp1.writeGPIOAB(ic1out);
+      
+    }
   }
-
-  digitalWrite(kPin_LED_Red, LOW);
+  bitSet(ic1out,cepin); mcp1.writeGPIOAB(ic1out);
 }
-
+//W00000:112233445566778899AABBCCDDEEFF00
 // ----------------------------------------------------------------------------------------
 
 // this function assumes that data lines have already been set as INPUTS, and that
 // nOE is set LOW.
-byte ReadByteFrom(int addr)
+byte ReadByteFrom(long addr)
 {
   SetAddress(addr);
-  digitalWrite(kPin_nCE, LOW);
-  delayMicroseconds(k_uTime_ReadPulse_uS);
+  //digitalWrite(kPin_nCE, LOW);
+  bitClear(ic1out,cepin); mcp1.writeGPIOAB(ic1out);
   byte b = ReadData();
-  digitalWrite(kPin_nCE, HIGH);
-
+  //digitalWrite(kPin_nCE, HIGH);
+  bitSet(ic1out,cepin); mcp1.writeGPIOAB(ic1out);
   return b;
 }
 
 // this function assumes that data lines have already been set as OUTPUTS, and that
 // nOE is set HIGH.
-void WriteByteTo(int addr, byte b)
+void WriteByteTo(long addr, byte b)
 {
   SetAddress(addr);
   SetData(b);
 
-  digitalWrite(kPin_nCE, LOW);
-  digitalWrite(kPin_nWE, LOW); // enable write
-  delayMicroseconds(k_uTime_WritePulse_uS);
+  //digitalWrite(kPin_nCE, LOW);
+  //bitClear(ic1out,cepin); mcp1.writeGPIOAB(ic1out);
+  //digitalWrite(kPin_nWE, LOW); // enable write
+  bitClear(ic1out,wepin); mcp1.writeGPIOAB(ic1out);
 
-  digitalWrite(kPin_nWE, HIGH); // disable write
-  digitalWrite(kPin_nCE, HIGH);
+  //digitalWrite(kPin_nWE, HIGH); // disable write
+  bitSet(ic1out,wepin); mcp1.writeGPIOAB(ic1out);  
+  //digitalWrite(kPin_nCE, HIGH);
+  //bitSet(ic1out,cepin); mcp1.writeGPIOAB(ic1out);
 }
 
 // ----------------------------------------------------------------------------------------
 
 void SetDataLinesAsInputs()
 {
-  pinMode(kPin_Data0, INPUT);
-  pinMode(kPin_Data1, INPUT);
-  pinMode(kPin_Data2, INPUT);
-  pinMode(kPin_Data3, INPUT);
-  pinMode(kPin_Data4, INPUT);
-  pinMode(kPin_Data5, INPUT);
-  pinMode(kPin_Data6, INPUT);
-  pinMode(kPin_Data7, INPUT);
+  for (uint8_t i=0;i<=7;i++){
+    if (dataRoute[i]==IC1){
+      mcp1.pinMode(dataArray[i],INPUT);
+    } else if (dataRoute[i]==IC2){
+      mcp2.pinMode(dataArray[i],INPUT);
+    }
+  }
 }
 
 void SetDataLinesAsOutputs()
 {
-  pinMode(kPin_Data0, OUTPUT);
-  pinMode(kPin_Data1, OUTPUT);
-  pinMode(kPin_Data2, OUTPUT);
-  pinMode(kPin_Data3, OUTPUT);
-  pinMode(kPin_Data4, OUTPUT);
-  pinMode(kPin_Data5, OUTPUT);
-  pinMode(kPin_Data6, OUTPUT);
-  pinMode(kPin_Data7, OUTPUT);
+  for (uint8_t i=0;i<=7;i++){
+    if (dataRoute[i]==IC1){
+      mcp1.pinMode(dataArray[i],OUTPUT);
+    } else if (dataRoute[i]==IC2){
+      mcp2.pinMode(dataArray[i],OUTPUT);
+    }
+  }
 }
 
-void SetAddress(int a)
+void SetAddress(long a)
 {
-  digitalWrite(kPin_Addr0,  (a&1)?HIGH:LOW    );
-  digitalWrite(kPin_Addr1,  (a&2)?HIGH:LOW    );
-  digitalWrite(kPin_Addr2,  (a&4)?HIGH:LOW    );
-  digitalWrite(kPin_Addr3,  (a&8)?HIGH:LOW    );
-  digitalWrite(kPin_Addr4,  (a&16)?HIGH:LOW   );
-  digitalWrite(kPin_Addr5,  (a&32)?HIGH:LOW   );
-  digitalWrite(kPin_Addr6,  (a&64)?HIGH:LOW   );
-  digitalWrite(kPin_Addr7,  (a&128)?HIGH:LOW  );
-  digitalWrite(kPin_Addr8,  (a&256)?HIGH:LOW  );
-  digitalWrite(kPin_Addr9,  (a&512)?HIGH:LOW  );
-  digitalWrite(kPin_Addr10, (a&1024)?HIGH:LOW );
-  digitalWrite(kPin_Addr11, (a&2048)?HIGH:LOW );
-  digitalWrite(kPin_Addr12, (a&4096)?HIGH:LOW );
-  digitalWrite(kPin_Addr13, (a&8192)?HIGH:LOW );
-  digitalWrite(kPin_Addr14, (a&16384)?HIGH:LOW);
+  for (uint8_t i=0;i<=18;i++){
+    if (addrRoute[i]==IC1){
+      if ( a & long(round(pow(2,i))) ){
+        bitSet(ic1out,addrArray[i]);
+      } else {
+        bitClear(ic1out,addrArray[i]);
+      }
+    } else if (addrRoute[i]==IC2){
+      if ( a & long(round(pow(2,i))) ) {
+        bitSet(ic2out,addrArray[i]);
+      } else {
+        bitClear(ic2out,addrArray[i]);
+      }
+    }
+  }
+
+  mcp1.writeGPIOAB(ic1out);
+  mcp2.writeGPIOAB(ic2out);
 }
 
 // this function assumes that data lines have already been set as OUTPUTS.
 void SetData(byte b)
 {
-  digitalWrite(kPin_Data0, (b&1)?HIGH:LOW  );
-  digitalWrite(kPin_Data1, (b&2)?HIGH:LOW  );
-  digitalWrite(kPin_Data2, (b&4)?HIGH:LOW  );
-  digitalWrite(kPin_Data3, (b&8)?HIGH:LOW  );
-  digitalWrite(kPin_Data4, (b&16)?HIGH:LOW );
-  digitalWrite(kPin_Data5, (b&32)?HIGH:LOW );
-  digitalWrite(kPin_Data6, (b&64)?HIGH:LOW );
-  digitalWrite(kPin_Data7, (b&128)?HIGH:LOW);
+  for (uint8_t i=0;i<=7;i++){
+    if (dataRoute[i]==IC1){
+      if ( b & (1 << i) ){
+        bitSet(ic1out,dataArray[i]);
+      } else {
+        bitClear(ic1out,dataArray[i]);
+      }
+    } else if (dataRoute[i]==IC2){
+      if ( b & (1 << i) ) {
+        bitSet(ic2out,dataArray[i]);
+      } else {
+        bitClear(ic2out,dataArray[i]);
+      }
+    }
+  }
+  
+  mcp1.writeGPIOAB(ic1out);
+  mcp2.writeGPIOAB(ic2out);
 }
 
 // this function assumes that data lines have already been set as INPUTS.
@@ -433,15 +492,17 @@ byte ReadData()
 {
   byte b = 0;
 
-  if (digitalRead(kPin_Data0) == HIGH) b |= 1;
-  if (digitalRead(kPin_Data1) == HIGH) b |= 2;
-  if (digitalRead(kPin_Data2) == HIGH) b |= 4;
-  if (digitalRead(kPin_Data3) == HIGH) b |= 8;
-  if (digitalRead(kPin_Data4) == HIGH) b |= 16;
-  if (digitalRead(kPin_Data5) == HIGH) b |= 32;
-  if (digitalRead(kPin_Data6) == HIGH) b |= 64;
-  if (digitalRead(kPin_Data7) == HIGH) b |= 128;
-
+  for (uint8_t i=0;i<=7;i++) {
+    if (dataRoute[i]==IC1){
+      if ( mcp1.digitalRead(dataArray[i]) ) {
+        bitSet(b,i);
+      }
+    } else if (dataRoute[i]==IC2){
+      if ( mcp2.digitalRead(dataArray[i]) ) {
+        bitSet(b,i);
+      }      
+    }
+  }
   return(b);
 }
 
@@ -506,5 +567,4 @@ byte HexToVal(byte b)
   if (b >= 'a' && b <= 'f') return((b - 'a') + 10);
   return(0);
 }
-
 
